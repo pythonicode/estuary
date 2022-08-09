@@ -52,6 +52,8 @@ import (
 var appVersion string
 var log = logging.Logger("estuary").With("app_version", appVersion)
 
+var s *Server
+
 type storageMiner struct {
 	gorm.Model
 	Address         util.DbAddr `gorm:"unique"`
@@ -560,7 +562,7 @@ func main() {
 			otel.SetTracerProvider(tp)
 		}
 
-		s := &Server{
+		s = &Server{
 			DB:          db,
 			Node:        nd,
 			Api:         api,
@@ -671,7 +673,7 @@ func setupDatabase(dbConnStr string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	if err = migrateSchemas(db); err != nil {
+	if err = MigrateSchemas(db); err != nil {
 		return nil, err
 	}
 
@@ -695,7 +697,7 @@ func setupDatabase(dbConnStr string) (*gorm.DB, error) {
 	return db, nil
 }
 
-func migrateSchemas(db *gorm.DB) error {
+func MigrateSchemas(db *gorm.DB) error {
 	if err := db.AutoMigrate(
 		&util.Content{},
 		&util.Object{},

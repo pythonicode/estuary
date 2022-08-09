@@ -11,7 +11,7 @@ Requirements:
 - [hwloc](https://www.open-mpi.org/projects/hwloc/)
 - opencl
 
-1. Run `make clean all` inside the estuary directory
+Run `make clean all` inside the estuary directory
 
 ## Running your own node
 
