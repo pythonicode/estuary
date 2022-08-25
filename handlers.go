@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/application-research/estuary/constants"
 	"github.com/application-research/estuary/node/modules/peering"
 	"github.com/libp2p/go-libp2p-core/network"
 
@@ -99,12 +100,12 @@ func (s *Server) ServeAPI() error {
 
 	e.Binder = new(binder)
 
-	if s.estuaryCfg.Logging.ApiEndpointLogging {
+	if s.cfg.Logging.ApiEndpointLogging {
 		e.Use(middleware.Logger())
 	}
 
 	e.Use(s.tracingMiddleware)
-	e.Use(util.AppVersionMiddleware(s.estuaryCfg.AppVersion))
+	e.Use(util.AppVersionMiddleware(s.cfg.AppVersion))
 	e.HTTPErrorHandler = util.ErrorHandler
 
 	e.GET("/debug/pprof/:prof", serveProfile)
@@ -311,7 +312,7 @@ func (s *Server) ServeAPI() error {
 	if os.Getenv("ENABLE_SWAGGER_ENDPOINT") == "true" {
 		e.GET("/swagger/*", echoSwagger.WrapHandler)
 	}
-	return e.Start(s.estuaryCfg.ApiListen)
+	return e.Start(s.cfg.ApiListen)
 }
 
 type binder struct{}
@@ -345,7 +346,7 @@ func serveProfile(c echo.Context) error {
 type statsResp struct {
 	ID              uint    `json:"id"`
 	Cid             cid.Cid `json:"cid"`
-	Filename        string  `json:"filename"`
+	Filename        string  `json:"name"`
 	BWUsed          int64   `json:"bwUsed"`
 	TotalRequests   int64   `json:"totalRequests"`
 	Offloaded       bool    `json:"offloaded"`
@@ -408,7 +409,7 @@ func (s *Server) handleStats(c echo.Context, u *User) error {
 		st := statsResp{
 			ID:       c.ID,
 			Cid:      c.Cid.CID,
-			Filename: c.Filename,
+			Filename: c.Name,
 		}
 
 		if false {
@@ -615,7 +616,7 @@ func (s *Server) handleAddIpfs(c echo.Context, u *User) error {
 		return err
 	}
 
-	filename := params.Filename
+	filename := params.Name
 	if filename == "" {
 		filename = params.Root
 	}
@@ -781,7 +782,7 @@ func (s *Server) handleAddCar(c echo.Context, u *User) error {
 
 	go func() {
 		// TODO: we should probably have a queue to throw these in instead of putting them out in goroutines...
-		s.CM.ToCheck <- cont.ID
+		s.CM.toCheck(cont.ID)
 	}()
 
 	go func() {
@@ -925,7 +926,7 @@ func (s *Server) handleAdd(c echo.Context, u *User) error {
 	if err != nil {
 		return xerrors.Errorf("encountered problem computing object references: %w", err)
 	}
-	fullPath := filepath.Join(path, content.Filename)
+	fullPath := filepath.Join(path, content.Name)
 
 	if col != nil {
 		log.Infof("COLLECTION CREATION: %d, %d", col.ID, content.ID)
@@ -943,7 +944,7 @@ func (s *Server) handleAdd(c echo.Context, u *User) error {
 	}
 
 	go func() {
-		s.CM.ToCheck <- content.ID
+		s.CM.toCheck(content.ID)
 	}()
 
 	if c.QueryParam("lazy-provide") != "true" {
@@ -1096,7 +1097,7 @@ func (cm *ContentManager) addDatabaseTrackingToContent(ctx context.Context, cont
 	if err != nil {
 		return err
 	}
-	return cm.addObjectsToDatabase(ctx, cont, dserv, root, objects, util.ContentLocationLocal)
+	return cm.addObjectsToDatabase(ctx, cont, dserv, root, objects, constants.ContentLocationLocal)
 }
 
 func (cm *ContentManager) addDatabaseTracking(ctx context.Context, u *User, dserv ipld.NodeGetter, root cid.Cid, filename string, replication int) (*util.Content, error) {
@@ -1105,12 +1106,12 @@ func (cm *ContentManager) addDatabaseTracking(ctx context.Context, u *User, dser
 
 	content := &util.Content{
 		Cid:         util.DbCID{CID: root},
-		Filename:    filename,
+		Name:        filename,
 		Active:      false,
 		Pinning:     true,
 		UserID:      u.ID,
 		Replication: replication,
-		Location:    util.ContentLocationLocal,
+		Location:    constants.ContentLocationLocal,
 	}
 
 	if err := cm.DB.Create(content).Error; err != nil {
@@ -1180,7 +1181,7 @@ func (s *Server) handleEnsureReplication(c echo.Context) error {
 
 	fmt.Println("Content: ", content.Cid.CID, data)
 
-	s.CM.ToCheck <- content.ID
+	s.CM.toCheck(content.ID)
 	return nil
 }
 
@@ -1602,7 +1603,7 @@ func (s *Server) handleMakeDeal(c echo.Context, u *User) error {
 		}
 	}
 
-	id, err := s.CM.makeDealWithMiner(ctx, cont, addr, true)
+	id, err := s.CM.makeDealWithMiner(ctx, cont, addr)
 	if err != nil {
 		return err
 	}
@@ -1962,7 +1963,7 @@ func (s *Server) handleGetSystemConfig(c echo.Context, u *User) error {
 
 	resp := map[string]interface{}{
 		"data": map[string]interface{}{
-			"primary":  s.estuaryCfg,
+			"primary":  s.cfg,
 			"shuttles": shts,
 		},
 	}
@@ -3065,10 +3066,10 @@ func (s *Server) handleGetViewer(c echo.Context, u *User) error {
 		Miners:   s.getMinersOwnedByUser(u),
 		Settings: util.UserSettings{
 			Replication:           s.CM.Replication,
-			Verified:              s.CM.VerifiedDeal,
-			DealDuration:          dealDuration,
-			MaxStagingWait:        maxStagingZoneLifetime,
-			FileStagingThreshold:  int64(individualDealThreshold),
+			Verified:              s.cfg.Deal.IsVerified,
+			DealDuration:          s.cfg.Deal.Duration,
+			MaxStagingWait:        s.cfg.StagingBucket.MaxLifeTime,
+			FileStagingThreshold:  s.cfg.StagingBucket.IndividualDealThreshold,
 			ContentAddingDisabled: s.isContentAddingDisabled(u),
 			DealMakingDisabled:    s.CM.dealMakingDisabled(),
 			UploadEndpoints:       uep,
@@ -3414,7 +3415,7 @@ func (s *Server) handleCommitCollection(c echo.Context, u *User) error {
 	// create DAG respecting directory structure
 	collectionNode := unixfs.EmptyDirNode()
 	for _, c := range contents {
-		dirs, err := util.DirsFromPath(c.Path, c.Filename)
+		dirs, err := util.DirsFromPath(c.Path, c.Name)
 		if err != nil {
 			return err
 		}
@@ -3423,7 +3424,7 @@ func (s *Server) handleCommitCollection(c echo.Context, u *User) error {
 		if err != nil {
 			return err
 		}
-		err = lastDirNode.AddRawLink(c.Filename, &ipld.Link{
+		err = lastDirNode.AddRawLink(c.Name, &ipld.Link{
 			Size: uint64(c.Size),
 			Cid:  c.Cid.CID,
 		})
@@ -3490,7 +3491,7 @@ func (s *Server) handleGetCollectionContents(c echo.Context, u *User) error {
 	dirs := make(map[string]bool)
 	var out []collectionListResponse
 	for _, r := range refs {
-		if r.Path == "" || r.Filename == "" {
+		if r.Path == "" || r.Name == "" {
 			continue
 		}
 
@@ -3511,7 +3512,7 @@ func (s *Server) handleGetCollectionContents(c echo.Context, u *User) error {
 			}
 
 			out = append(out, collectionListResponse{
-				Name:      r.Filename,
+				Name:      r.Name,
 				Size:      r.Size,
 				ContID:    r.ID,
 				Cid:       &util.DbCID{CID: r.Cid.CID},
@@ -4140,7 +4141,7 @@ func (s *Server) handleContentHealthCheck(c echo.Context) error {
 		fixedAggregateSize = true
 	}
 
-	if cont.Location != util.ContentLocationLocal {
+	if cont.Location != constants.ContentLocationLocal {
 		return c.JSON(http.StatusOK, map[string]interface{}{
 			"deals":              deals,
 			"content":            cont,
@@ -4680,9 +4681,9 @@ func (s *Server) handleCreateContent(c echo.Context, u *User) error {
 
 	content := &util.Content{
 		Cid:         util.DbCID{CID: rootCID},
-		Filename:    req.Filename,
+		Name:        req.Name,
 		Active:      false,
-		Pinning:     false,
+		Pinning:     true,
 		UserID:      u.ID,
 		Replication: s.CM.Replication,
 		Location:    req.Location,
@@ -4703,7 +4704,6 @@ func (s *Server) handleCreateContent(c echo.Context, u *User) error {
 		}
 
 		path := &sp
-
 		if err := s.DB.Create(&CollectionRef{
 			Collection: col.ID,
 			Content:    content.ID,
@@ -5040,7 +5040,7 @@ func (s *Server) handleShuttleCreateContent(c echo.Context) error {
 		return err
 	}
 
-	log.Debugw("handle shuttle create content", "root", req.Root, "user", req.User, "dsr", req.DagSplitRoot, "name", req.Filename)
+	log.Debugw("handle shuttle create content", "root", req.Root, "user", req.User, "dsr", req.DagSplitRoot, "name", req.Name)
 
 	root, err := cid.Decode(req.Root)
 	if err != nil {
@@ -5053,9 +5053,9 @@ func (s *Server) handleShuttleCreateContent(c echo.Context) error {
 
 	content := &util.Content{
 		Cid:         util.DbCID{CID: root},
-		Filename:    req.Filename,
+		Name:        req.Name,
 		Active:      false,
-		Pinning:     false,
+		Pinning:     true,
 		UserID:      req.User,
 		Replication: s.CM.Replication,
 		Location:    req.Location,
@@ -5322,7 +5322,7 @@ func (s *Server) checkGatewayRedirect(proto string, cc cid.Cid, segs []string) (
 		return "", err
 	}
 
-	if cont.Location == util.ContentLocationLocal {
+	if cont.Location == constants.ContentLocationLocal {
 		return "", nil
 	}
 

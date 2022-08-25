@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/application-research/estuary/constants"
 	"github.com/application-research/estuary/node/modules/peering"
 	"github.com/multiformats/go-multiaddr"
 
@@ -146,7 +147,7 @@ func overrideSetOptions(flags []cli.Flag, cctx *cli.Context, cfg *config.Estuary
 		case "disable-new-deals":
 			cfg.Deal.Disable = cctx.Bool("disable-new-deals")
 		case "verified-deal":
-			cfg.Deal.Verified = cctx.Bool("verified-deal")
+			cfg.Deal.IsVerified = cctx.Bool("verified-deal")
 		case "fail-deals-on-transfer-failure":
 			cfg.Deal.FailOnTransferFailure = cctx.Bool("fail-deals-on-transfer-failure")
 		case "disable-local-content-adding":
@@ -169,11 +170,12 @@ func overrideSetOptions(flags []cli.Flag, cctx *cli.Context, cfg *config.Estuary
 			cfg.Node.Bitswap.TargetMessageSize = cctx.Int("bitswap-target-message-size")
 		case "shuttle-message-handlers":
 			cfg.ShuttleMessageHandlers = cctx.Int("shuttle-message-handlers")
+		case "staging-bucket":
+			cfg.StagingBucket.Enabled = cctx.Bool("staging-bucket")
 		case "indexer-url":
 			cfg.Node.IndexerURL = cctx.String("indexer-url")
 		case "indexer-tick-interval":
 			cfg.Node.IndexerTickInterval = cctx.Int("indexer-tick-interval")
-
 		case "deal-protocol-version":
 			dprs := make(map[protocol.ID]bool, 0)
 			for _, dprv := range cctx.StringSlice("deal-protocol-version") {
@@ -187,7 +189,6 @@ func overrideSetOptions(flags []cli.Flag, cctx *cli.Context, cfg *config.Estuary
 			if len(dprs) > 0 {
 				cfg.Deal.EnabledDealProtocolsVersions = dprs
 			}
-
 		default:
 		}
 	}
@@ -303,7 +304,7 @@ func main() {
 		&cli.BoolFlag{
 			Name:  "verified-deal",
 			Usage: "Defaults to makes deals as verified deal using datacap. Set to false to make deal as regular deal using real FIL(no datacap)",
-			Value: cfg.Deal.Verified,
+			Value: cfg.Deal.IsVerified,
 		},
 		&cli.BoolFlag{
 			Name:  "disable-content-adding",
@@ -375,6 +376,11 @@ func main() {
 			Usage: "sets shuttle message handler count",
 			Value: cfg.ShuttleMessageHandlers,
 		},
+		&cli.BoolFlag{
+			Name:  "staging-bucket",
+			Usage: "enable staging bucket",
+			Value: cfg.StagingBucket.Enabled,
+    },
 		&cli.StringSliceFlag{
 			Name:  "deal-protocol-version",
 			Usage: "sets the deal protocol version. defaults to v110 (go-fil-markets) and v120 (boost)",
@@ -568,7 +574,7 @@ func main() {
 			tracer:      otel.Tracer("api"),
 			cacher:      memo.NewCacher(),
 			gwayHandler: gateway.NewGatewayHandler(nd.Blockstore),
-			estuaryCfg:  cfg,
+			cfg:         cfg,
 		}
 
 		// TODO: this is an ugly self referential hack... should fix
@@ -629,17 +635,8 @@ func main() {
 			init.trackingBstore.SetCidReqFunc(cm.RefreshContentForCid)
 		}
 
-		go cm.ContentWatcher()
+		go cm.Run(cctx.Context)                                               // deal making and deal reconciliation
 		go cm.handleShuttleMessages(cctx.Context, cfg.ShuttleMessageHandlers) // register workers/handlers to process shuttle rpc messages from a channel(queue)
-
-		// refresh pin queue for local contents
-		if !cm.globalContentAddingDisabled {
-			go func() {
-				if err := cm.refreshPinQueue(cctx.Context, util.ContentLocationLocal); err != nil {
-					log.Errorf("failed to refresh pin queue: %s", err)
-				}
-			}()
-		}
 
 		s.Node.ArEngine, err = autoretrieve.NewAutoretrieveEngine(context.Background(), cfg, s.DB, s.Node.Host, s.Node.Datastore)
 		if err != nil {
@@ -652,7 +649,7 @@ func main() {
 		go func() {
 			time.Sleep(time.Second * 10)
 
-			if err := s.RestartAllTransfersForLocation(cctx.Context, util.ContentLocationLocal); err != nil {
+			if err := s.RestartAllTransfersForLocation(cctx.Context, constants.ContentLocationLocal); err != nil {
 				log.Errorf("failed to restart transfers: %s", err)
 			}
 		}()
@@ -721,7 +718,7 @@ func migrateSchemas(db *gorm.DB) error {
 }
 
 type Server struct {
-	estuaryCfg *config.Estuary
+	cfg        *config.Estuary
 	tracer     trace.Tracer
 	Node       *node.Node
 	DB         *gorm.DB
@@ -807,14 +804,16 @@ func (cm *ContentManager) RestartTransfer(ctx context.Context, loc string, chani
 			return err
 		}
 
-		if util.TransferTerminated(st) {
+		isTerm, msg := util.TransferTerminated(st)
+		if isTerm {
 			if err := cm.DB.Model(contentDeal{}).Where("id = ?", dealID).UpdateColumns(map[string]interface{}{
 				"failed":    true,
 				"failed_at": time.Now(),
 			}).Error; err != nil {
 				return err
 			}
-			return fmt.Errorf("deal in database is in progress, but data transfer is terminated: %d", st.Status)
+			errMsg := fmt.Sprintf("status: %d(%s), message: %s", st.Status, msg, st.Message)
+			return fmt.Errorf("deal in database is in progress, but data transfer is terminated: %s", errMsg)
 		}
 		return cm.FilClient.RestartTransfer(ctx, &chanid)
 	}
